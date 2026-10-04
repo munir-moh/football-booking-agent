@@ -4,7 +4,7 @@ const API_URL = (import.meta.env.VITE_AGENT_API_URL || "http://127.0.0.1:5001").
 const WELCOME = {
   id: "welcome",
   role: "assistant",
-  text: "Hi, I’m your football booking assistant. Tell me when you’d like to play and I’ll check with the booking service.",
+  text: "Hi, I’m your booking agent. Tell me when you’d like to play.",
 };
 
 function newSessionId() {
@@ -186,7 +186,7 @@ export default function App() {
       <header className="topbar">
         <a className="brand" href="/" aria-label="Pitchside home">
           <span className="brand-mark" aria-hidden="true"><span /></span>
-          <span className="brand-name">pitchside<span>.</span></span>
+          <span className="brand-name">MM's Booking Agent<span>.</span></span>
         </a>
         <div className="topbar-right">
           <div className={"connection connection-" + connection} role="status">
@@ -203,8 +203,8 @@ export default function App() {
       <section className="chat-layout" aria-label="Football booking assistant">
         <div className="welcome-panel">
           <div className="pitch-badge"><span /> ELITE FOOTBALL PITCH</div>
-          <h1>Your next match<br />starts <em>here.</em></h1>
-          <p>Check a time, get the price, and book your pitch in a few messages.</p>
+          <h1>Tell me when you <br />want to <em>play.</em></h1>
+          <p>Your pitch. Your time. I'll handle the rest</p>
           <div className="pitch-facts" aria-label="Booking information">
             <div><span className="fact-icon">◷</span><span><b>Live slot checks</b><small>Checked with the booking service</small></span></div>
             <div><span className="fact-icon">◉</span><span><b>Price before checkout</b><small>Confirmed for your selected time</small></span></div>
@@ -220,10 +220,9 @@ export default function App() {
           <div className="chat-heading">
             <div className="agent-avatar"><span>⚽</span><i /></div>
             <div className="chat-heading-copy">
-              <strong>Pitchside assistant</strong>
+              <strong>Booking Agent</strong>
               <span>Here to get you on the pitch</span>
             </div>
-            <div className="secure-label"><span aria-hidden="true">▣</span> SECURE</div>
           </div>
 
           <div className="message-list" aria-live="polite" aria-relevant="additions text">
@@ -303,9 +302,9 @@ export default function App() {
           </div>
         </section>
 
-        <p className="privacy-note"><span aria-hidden="true">◈</span> Payments happen on Paystack. Never share card details in chat.</p>
+        <p className="privacy-note"><span aria-hidden="true"></span> Payments happen on Paystack. Never share card details in chat.</p>
       </section>
-      <footer className="footer-note">Made for the love of the game <span>·</span> Lagos, Nigeria</footer>
+      <footer className="footer-note">Made for the love of the game <span>·</span></footer>
     </main>
   );
 }
