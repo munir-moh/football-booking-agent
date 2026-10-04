@@ -1,10 +1,3 @@
-"""Small chat/booking orchestrator for the existing football booking API.
-
-The agent does not connect to the booking database. Availability and payment
-status are read through the backend's existing controlled API routes. Booking
-creation always goes through POST /api/book, which performs the final check.
-"""
-
 from datetime import date, datetime, timedelta
 from threading import Lock
 from time import time
@@ -39,8 +32,6 @@ allowed_origins = [
 ]
 CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
-# Prototype conversation state is kept in memory. It contains a booking draft
-# until checkout starts, then retains the reference for payment-status checks.
 sessions = {}
 sessions_lock = Lock()
 rate_windows = {}
@@ -92,7 +83,6 @@ class BackendError(Exception):
 
 
 def backend_request(method, path, **kwargs):
-    """Call a fixed backend route; callers never supply an arbitrary URL."""
     try:
         response = requests.request(
             method,
@@ -165,7 +155,6 @@ def add_history(state, role, content):
 
 
 def parse_date(text):
-    """Resolve common explicit dates and relative days in Africa/Lagos time."""
     today = datetime.now(LAGOS).date()
     lowered = text.lower()
 
@@ -227,9 +216,7 @@ def parse_times(text):
         end_minute = int(range_match.group("em") or 0)
         start_ampm = range_match.group("sa")
         end_ampm = range_match.group("ea")
-
-        # If only the end has AM/PM, use it for the start unless the range
-        # crosses noon or midnight (for example, 11 to 1 p.m.).
+        
         if not start_ampm and end_ampm and start_hour <= 12 and end_hour <= 12:
             end_is_pm = end_ampm.lower().startswith("p")
             if end_hour == 12:
