@@ -63,6 +63,16 @@ For a deployed frontend, set `VITE_AGENT_API_URL` to the deployed agent API URL 
 
 For local payment returns, point the agent's `FOOTBALL_BACKEND_API_URL` at your locally running backend, set `AGENT_FRONTEND_URL=http://localhost:5174` in the backend's `.env`, and restart the backend. For a deployment, deploy this backend change and set `AGENT_FRONTEND_URL` to the deployed agent website origin in the backend host's environment settings. Keep `FRONTEND_URL` set to the normal booking website origin.
 
+### Deploy the agent website to Vercel
+
+1. Import the GitHub repository that contains the agent project.
+2. Set the Vercel project Root Directory to `frontend` (if the repository root is already the frontend folder, leave it at `.`).
+3. Use the Vite framework preset, build command `npm run build`, and output directory `dist`.
+4. Add `VITE_AGENT_API_URL` with the public Render URL of the agent API, for example `https://<agent-api>.onrender.com`. Do not add `/api` or a trailing slash.
+5. Deploy. After Vercel gives the site its URL, set that origin as `AGENT_ALLOWED_ORIGINS` on the agent API Render service and as `AGENT_FRONTEND_URL` on the existing booking backend Render service. Redeploy those services so the new settings take effect.
+
+The `frontend/vercel.json` rewrite sends `/payment-callback` to the Vite app, where it checks payment status with the agent API.
+
 This prototype has no user login. Keep the agent API local for now; CORS and rate limiting do not stop non-browser callers from using an exposed API. Add authentication before making the API publicly reachable, because it can create checkouts using the saved profile.
 
 ## Step-by-step tryout
