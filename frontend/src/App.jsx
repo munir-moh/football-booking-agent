@@ -300,7 +300,7 @@ export default function App() {
       <header className="topbar">
         <a className="brand" href="/" aria-label="Pitchside home">
           <span className="brand-mark" aria-hidden="true"><span /></span>
-          <span className="brand-name">MM's Booking Agent<span>.</span></span>
+          <span className="brand-name">Elite Football Pitch Agent<span>.</span></span>
         </a>
         <div className="topbar-right">
           {authUser && (
