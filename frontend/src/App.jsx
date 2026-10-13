@@ -5,30 +5,11 @@ const AUTH_TOKEN_KEY = "football-agent-token";
 const WELCOME = {
   id: "welcome",
   role: "assistant",
-  text: "Hi, I’m your booking agent. Tell me when you’d like to play.",
+  text: "How can I help with your booking?",
 };
 
 function newSessionId() {
   return window.crypto?.randomUUID?.() || String(Date.now()) + "-" + Math.random().toString(36).slice(2);
-}
-
-function WelcomePanel() {
-  return (
-    <div className="welcome-panel">
-      <div className="pitch-badge"><span /> ELITE FOOTBALL PITCH</div>
-      <h1>Tell me when you <br />want to <em>play.</em></h1>
-      <p>Your pitch. Your time. I'll handle the rest</p>
-      <div className="pitch-facts" aria-label="Booking information">
-        <div><span className="fact-icon">◷</span><span><b>Live slot checks</b><small>Checked with the booking service</small></span></div>
-        <div><span className="fact-icon">◉</span><span><b>Price before checkout</b><small>Confirmed for your selected time</small></span></div>
-      </div>
-      <div className="field-lines" aria-hidden="true">
-        <div className="field-center" />
-        <div className="field-box field-box-left" />
-        <div className="field-box field-box-right" />
-      </div>
-    </div>
-  );
 }
 
 export default function App() {
@@ -340,30 +321,22 @@ export default function App() {
       </header>
 
       {authLoading ? (
-        <section className="chat-layout auth-layout" aria-live="polite">
-          <WelcomePanel />
+        <section className="auth-layout" aria-live="polite">
           <div className="auth-card auth-loading">Checking your account…</div>
         </section>
       ) : !authUser ? (
-        <section className="chat-layout auth-layout" aria-label="Booking agent account">
-          <WelcomePanel />
+        <section className="auth-layout" aria-label="Booking agent account">
           <section className="auth-card" aria-labelledby="auth-title">
-            <div className="auth-kicker">YOUR BOOKING PROFILE</div>
-            <h2 id="auth-title">{authMode === "register" ? "Create your account" : "Welcome back"}</h2>
-            <p className="auth-intro">
-              {authMode === "register"
-                ? "Save your details once. The agent will use them when you book."
-                : "Log in to check pitch availability and book using your saved details."}
-            </p>
+            <h2 id="auth-title">{authMode === "register" ? "Create account" : "Log in"}</h2>
             {paymentReturnPending && (
-              <div className="auth-notice" role="status">Log in to return to the agent and check your payment.</div>
+              <div className="auth-notice" role="status">Log in to check your payment.</div>
             )}
             {authNotice && <div className="auth-notice" role="status">{authNotice}</div>}
             {authError && <div className="auth-error" role="alert">{authError}</div>}
             <form className="auth-form" onSubmit={submitAuth}>
               {authMode === "register" && (
                 <label>
-                  Full name
+                  Name
                   <input
                     type="text"
                     autoComplete="name"
@@ -376,7 +349,7 @@ export default function App() {
                 </label>
               )}
               <label>
-                Email address
+                Email
                 <input
                   type="email"
                   autoComplete="email"
@@ -388,7 +361,7 @@ export default function App() {
               </label>
               {authMode === "register" && (
                 <label>
-                  Phone number
+                  Phone
                   <input
                     type="tel"
                     autoComplete="tel"
@@ -398,7 +371,6 @@ export default function App() {
                     onChange={(event) => setAuthForm((current) => ({ ...current, phone: event.target.value }))}
                     required
                   />
-                  <small>Enter the 11-digit phone number used for bookings.</small>
                 </label>
               )}
               <label>
@@ -412,7 +384,6 @@ export default function App() {
                   maxLength="128"
                   required
                 />
-                {authMode === "register" && <small>Use at least 8 characters.</small>}
               </label>
               <button className="auth-submit" type="submit" disabled={authBusy}>
                 {authBusy
@@ -433,24 +404,19 @@ export default function App() {
                 {authMode === "register" ? "Log in" : "Create an account"}
               </button>
             </p>
-            <p className="auth-security">Your password is stored as a secure hash. Payments are completed on Paystack.</p>
           </section>
         </section>
       ) : (
         <section className="chat-layout" aria-label="Football booking assistant">
-          <WelcomePanel />
-
           <section className="chat-card" aria-label="Chat">
             <div className="chat-heading">
               <div className="agent-avatar"><span>⚽</span><i /></div>
               <div className="chat-heading-copy">
                 <strong>Booking Agent</strong>
-                <span>Here to get you on the pitch</span>
               </div>
             </div>
 
             <div className="message-list" aria-live="polite" aria-relevant="additions text">
-              <div className="date-divider"><span>TODAY</span></div>
               {messages.map((message) => (
                 <article className={"message-row message-" + message.role} key={message.id}>
                   {message.role !== "user" && (
@@ -462,8 +428,7 @@ export default function App() {
                       <div className="checkout-card">
                         <div className="checkout-icon" aria-hidden="true">↗</div>
                         <div className="checkout-copy">
-                          <strong>Paystack secure checkout</strong>
-                          <span>Your card details stay on Paystack.</span>
+                          <strong>Paystack checkout</strong>
                         </div>
                         <a className="checkout-button" href={message.checkoutUrl}>
                           Continue <span aria-hidden="true">↗</span>
@@ -495,7 +460,7 @@ export default function App() {
 
             {lastReference && (
               <div className="payment-followup">
-                <div><span className="followup-dot" /><span>Payment reference <b>{lastReference}</b></span></div>
+                <div><span className="followup-dot" /><b>{lastReference}</b></div>
                 <button type="button" onClick={checkPayment} disabled={checkingPayment}>
                   {checkingPayment ? "Checking…" : "Check payment status"}
                 </button>
@@ -519,17 +484,10 @@ export default function App() {
                   {busy ? <span className="send-spinner" /> : <span aria-hidden="true">↑</span>}
                 </button>
               </div>
-              <div className="composer-foot">
-                <span>Enter to send · Shift + Enter for a new line</span>
-                <span>{input.length}/500</span>
-              </div>
             </div>
           </section>
-
-          <p className="privacy-note"><span aria-hidden="true"></span> Payments happen on Paystack. Never share card details in chat.</p>
         </section>
       )}
-      <footer className="footer-note">Made for the love of the game <span>·</span></footer>
     </main>
   );
 }
