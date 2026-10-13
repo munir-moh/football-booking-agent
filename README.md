@@ -1,94 +1,123 @@
 # Football Booking Agent
 
-A small React/Vite chat website and Python/Flask service that uses the existing football booking backend. The agent has no direct database connection and does not collect card details. The backend still checks the slot when it creates a Paystack checkout and remains responsible for payment verification and booking confirmation.
+A small React/Vite chat website and Python/Flask API that works with the existing football booking backend. Users create an account with their name, email, phone number, and password. The agent saves the profile in Supabase Postgres and uses it when starting bookings, so it does not ask for those details in chat.
 
-## What the agent does
+The agent calls the existing backend for availability, booking creation, and payment verification. It never connects to the football backend's database directly and never handles card numbers, CVV, PIN, or OTP. The user completes payment on the normal Paystack checkout page.
 
-- Uses `POST /api/ai/chat` for availability checks.
-- Uses `POST /api/book` to initialize checkout after the user gives a complete booking request. The agent uses the saved profile below, so it does not ask for name, email, or phone every time.
-- Uses `GET /api/payment/verify/<reference>` through its payment-status endpoint after returning from checkout.
-- Shows the payment confirmation inside the agent website when the backend returns the user to its `/payment-callback` page.
+## Account behavior
 
-Agent bookings send `client: "agent"` to the backend. The backend returns those Paystack checkouts to the server-configured `AGENT_FRONTEND_URL/payment-callback`; normal website requests still use `FRONTEND_URL/payment-callback`.
+- Registration requires a name, email, 11-digit phone number, and password of at least 8 characters.
+- Passwords are stored as Werkzeug password hashes, not plain text.
+- Login errors display `Incorrect email or password` for either a missing email or a wrong password.
+- Successful login creates a 14-day bearer session. The browser holds the session token in `sessionStorage`; the database stores only its SHA-256 hash.
+- Registration does not currently send email verification or provide password reset.
+- The agent creates three tables (`booking_agent_users`, `booking_agent_sessions`, and `booking_agent_bookings`) in Supabase the first time account storage is used. The configured Postgres user must be allowed to create tables and indexes.
+- Each Paystack reference is linked to the account that started the booking. Payment status checks only work for references owned by that account.
 
-The agent only displays checkout when the backend confirms `callback_client: "agent"`. This prevents an older backend deployment from silently sending an agent payment back to the normal website.
-
-## Run locally
+## Local setup
 
 You need Python 3.10+ and Node.js with npm.
 
-### 1. Configure the agent
+### 1. Create a Supabase database
 
-Open PowerShell in this folder and run:
+1. Create a Supabase project.
+2. In the Supabase project, choose **Connect** and copy a Postgres connection string. For a Render deployment, use the **Session pooler** connection if the service cannot connect to Supabase's direct endpoint over IPv6. The pooler string and database password come from the Supabase dashboard; percent-encode reserved characters in the password.
+3. Keep this string private. It belongs only in the Flask agent's environment, never in the Vite frontend or GitHub.
 
-    Copy-Item .env.example .env
-    python -m venv .venv
-    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Supabase's [database connection guide](https://supabase.com/docs/guides/database/connecting-to-postgres) explains the connection choices and where to copy each URI.
 
-If you created `.env` before this update, set `AGENT_ALLOWED_ORIGINS=http://localhost:5174` there to match the agent website's local port.
+### 2. Configure and install the agent API
 
-Edit the private `.env` file and add your booking details once:
+Open PowerShell in this project folder:
 
-    BOOKER_NAME=Your full name
-    BOOKER_EMAIL=you@example.com
-    BOOKER_PHONE=08031234567
+```powershell
+Copy-Item .env.example .env
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
-Use the phone format expected by the existing booking site: 11 digits. These values are read by the agent service and sent to the existing backend only when you ask it to book. `.env` is excluded from Git; do not put personal details in `.env.example` or share the `.env` file. Restart the agent after editing it.
+Set these values in the private `.env` file:
 
-The example points to the documented deployed backend. To use a locally running backend instead, set this in `.env`:
+```dotenv
+FOOTBALL_BACKEND_API_URL=https://football-booking-system.onrender.com
+SUPABASE_DATABASE_URL=postgresql://...copied-from-supabase...
+AGENT_ALLOWED_ORIGINS=http://localhost:5174
+```
 
-    FOOTBALL_BACKEND_API_URL=http://127.0.0.1:5000
+For a local football backend, use `FOOTBALL_BACKEND_API_URL=http://127.0.0.1:5000`. The former `BOOKER_NAME`, `BOOKER_EMAIL`, and `BOOKER_PHONE` settings are no longer used; remove any old copies from `.env`. The agent reads each profile from the account database instead.
 
-Do not copy the backend's Paystack secret, admin password, or database credentials into this project.
+Start the agent API in this PowerShell window:
 
-### 2. Start the agent API
+```powershell
+.\.venv\Scripts\python.exe app.py
+```
 
-In a PowerShell window in this folder:
+It listens at `http://127.0.0.1:5001`.
 
-    .\.venv\Scripts\python.exe app.py
-
-The agent API listens at `http://127.0.0.1:5001`.
-
-### 3. Start the chat website
+### 3. Start the website
 
 Open a second PowerShell window:
 
-    Set-Location .\frontend
-    npm install
-    npm run dev
+```powershell
+Set-Location .\frontend
+npm install
+npm run dev
+```
 
-Open `http://localhost:5174`.
+Open [http://localhost:5174](http://localhost:5174), create an account, then log in. If the backend returns `Incorrect email or password`, check both fields and try again.
 
-For a deployed frontend, set `VITE_AGENT_API_URL` to the deployed agent API URL at build time, and set `AGENT_ALLOWED_ORIGINS` in the agent API environment to the deployed website origin. The deployment must serve the app for the `/payment-callback` path as well as `/`.
+## Deploy the agent
 
-For local payment returns, point the agent's `FOOTBALL_BACKEND_API_URL` at your locally running backend, set `AGENT_FRONTEND_URL=http://localhost:5174` in the backend's `.env`, and restart the backend. For a deployment, deploy this backend change and set `AGENT_FRONTEND_URL` to the deployed agent website origin in the backend host's environment settings. Keep `FRONTEND_URL` set to the normal booking website origin.
+### Render: agent API
 
-### Deploy the agent website to Vercel
+Deploy the `football-booking-agent` repository as a Python web service on Render. Use:
 
-1. Import the GitHub repository that contains the agent project.
-2. Set the Vercel project Root Directory to `frontend` (if the repository root is already the frontend folder, leave it at `.`).
-3. Use the Vite framework preset, build command `npm run build`, and output directory `dist`.
-4. Add `VITE_AGENT_API_URL` with the public Render URL of the agent API, for example `https://<agent-api>.onrender.com`. Do not add `/api` or a trailing slash.
-5. Deploy. After Vercel gives the site its URL, set that origin as `AGENT_ALLOWED_ORIGINS` on the agent API Render service and as `AGENT_FRONTEND_URL` on the existing booking backend Render service. Redeploy those services so the new settings take effect.
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn app:app`
 
-The `frontend/vercel.json` rewrite sends `/payment-callback` to the Vite app, where it checks payment status with the agent API.
+Add these Render environment variables:
 
-This prototype has no user login. Keep the agent API local for now; CORS and rate limiting do not stop non-browser callers from using an exposed API. Add authentication before making the API publicly reachable, because it can create checkouts using the saved profile.
+| Variable | Value |
+| --- | --- |
+| `FOOTBALL_BACKEND_API_URL` | Public URL of the existing football backend, without a trailing slash |
+| `SUPABASE_DATABASE_URL` | Supabase Postgres connection URI copied from **Connect**; use Session pooler if required by the Render network |
+| `AGENT_ALLOWED_ORIGINS` | The exact deployed agent website origin, such as `https://your-agent.vercel.app` |
 
-## Step-by-step tryout
+Render supplies `PORT`. Do not set `BOOKER_NAME`, `BOOKER_EMAIL`, or `BOOKER_PHONE`; user details are per-account in Postgres. Do not place `SUPABASE_DATABASE_URL` in Vercel or expose it to the browser.
 
-1. Confirm `.env` has your name, email, and 11-digit phone number, and restart the agent API.
-2. Open the agent chat and ask: `Is Elite Pitch available tomorrow at 6 PM for one hour?` This checks availability only.
-3. To initialize a booking, ask for a complete slot, for example: `Book two hours for me tomorrow from 3 to 5 p.m.` The agent checks availability and, if available, immediately asks the backend to create the Paystack checkout. It should not ask for your name, email, or phone again.
-4. Confirm the pitch, date, time, and price in the reply. The agent shows a Paystack link. Opening it starts the existing payment flow; card details are entered only on Paystack.
-5. Complete payment on Paystack. The return should open the agent at `/payment-callback`; it then checks the reference with the backend and displays the confirmed status. Normal website bookings continue returning to the normal website.
+### Vercel: agent website
 
-Availability checks do not create bookings. Steps 3–4 do create a booking/payment initialization on the backend, even though the card payment is completed separately on Paystack. Use an available future slot and Paystack test credentials for a full checkout test.
+1. Import the agent repository into Vercel.
+2. Set the project Root Directory to `frontend`.
+3. Use build command `npm run build` and output directory `dist`.
+4. Set `VITE_AGENT_API_URL` to the public Render URL of the agent API, without `/api` or a trailing slash.
+5. Deploy. If Vercel provides a different website origin, add that exact origin to `AGENT_ALLOWED_ORIGINS` on Render and redeploy the API.
 
-## Current limits
+The Vite app also has a local default for `VITE_AGENT_API_URL` (`http://127.0.0.1:5001`). No database URL or Supabase secret belongs in this frontend variable.
 
-- The backend has one pitch and no endpoint that lists every available time slot. The agent checks a specific requested time and does not invent a daily schedule.
-- The backend's `/api/ai/chat` route is rate-limited, so this prototype is for low traffic.
-- Conversation drafts are held in memory and expire after one hour. Restarting the agent clears them.
-- The backend's payment verification flow can record a non-success response as `Failed`, and a later webhook may not update that record. If you completed payment but the agent reports `Failed`, do not pay again until the booking service has been checked.
-- The backend accepts only the fixed `client` values `website` and `agent`; it never accepts an arbitrary callback URL from the agent. The existing frontend files are unchanged.
+### Existing booking backend: Paystack return
+
+The existing backend must already support agent checkout callbacks. On the existing backend's Render service, keep its normal `FRONTEND_URL` unchanged and set `AGENT_FRONTEND_URL` to the agent website origin. Agent bookings send `client: "agent"`; normal website bookings continue using the normal website callback. The agent only displays a checkout link when the backend response identifies the callback as `agent`.
+
+## Step-by-step booking walkthrough
+
+1. Confirm the agent API is running and connected to Supabase and the existing booking backend.
+2. Open the agent site and choose **Create an account**. Enter your name, email, phone number as 11 digits, and a password of at least 8 characters.
+3. Log in with that email and password. To check the login error behavior, try an incorrect password; the form should show `Incorrect email or password`.
+4. Ask, for example, `Is Elite Pitch available tomorrow at 6 PM for one hour?` to check a slot without creating a booking.
+5. To start a booking, ask `Book two hours for me tomorrow from 3 to 5 p.m.` The agent uses the profile saved for your account, checks availability, then asks the existing backend to create the booking and initialize Paystack checkout.
+6. Review the pitch, time, and price shown by the booking backend. Open the Paystack checkout link and enter payment details only on Paystack.
+7. After Paystack returns to `/payment-callback`, log in if asked. The agent submits the reference to the existing backend's verification endpoint and shows the resulting booking status in chat.
+
+Availability checks do not create bookings. A complete booking request does create the backend booking/payment initialization before you pay. For a full payment test, use an available future slot and the existing backend's Paystack test configuration.
+
+## Existing backend constraints
+
+- The current backend exposes one pitch and does not provide an endpoint to list every available time slot. The agent checks a specific requested time and uses the backend's reply; it does not invent a daily schedule.
+- The agent uses `POST /api/ai/chat`, `POST /api/book`, and `GET /api/payment/verify/<reference>` through the existing backend API.
+- The backend's `/api/ai/chat` endpoint is rate-limited. This prototype is intended for low traffic.
+- Conversation drafts are held in the Flask process memory and expire after one hour. A service restart clears draft context.
+- Account registration and login are rate-limited in process memory. If deploying multiple agent instances, use shared rate limiting before opening registration to significant public traffic.
+- The backend may report a payment as failed or incomplete while its webhook is still processing. If a paid checkout shows `Failed`, do not pay again until the booking service has been checked.
+
+The existing booking backend and normal booking website are not changed by this agent account feature.

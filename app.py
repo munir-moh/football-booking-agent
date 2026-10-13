@@ -1,4 +1,7 @@
-from datetime import date, datetime, timedelta
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
+from secrets import token_urlsafe
 from threading import Lock
 from time import time
 from zoneinfo import ZoneInfo
@@ -7,10 +10,14 @@ import re
 import uuid
 from urllib.parse import urlparse
 
+import psycopg
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_cors import CORS
+from psycopg import errors as psycopg_errors
+from psycopg.rows import dict_row
+from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 
@@ -20,9 +27,8 @@ BACKEND_API_URL = os.getenv(
 ).rstrip("/")
 PORT = int(os.getenv("PORT", "5001"))
 LAGOS = ZoneInfo("Africa/Lagos")
-BOOKER_NAME = os.getenv("BOOKER_NAME", "").strip()
-BOOKER_EMAIL = os.getenv("BOOKER_EMAIL", "").strip()
-BOOKER_PHONE = re.sub(r"\D", "", os.getenv("BOOKER_PHONE", ""))
+SUPABASE_DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL", "").strip()
+AUTH_SESSION_DAYS = 14
 
 app = Flask(__name__)
 allowed_origins = [
@@ -30,7 +36,11 @@ allowed_origins = [
     for origin in os.getenv("AGENT_ALLOWED_ORIGINS", "http://localhost:5174").split(",")
     if origin.strip()
 ]
-CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
+CORS(
+    app,
+    resources={r"/api/*": {"origins": allowed_origins}},
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 sessions = {}
 sessions_lock = Lock()
@@ -38,6 +48,8 @@ rate_windows = {}
 rate_lock = Lock()
 SESSION_TTL_SECONDS = 60 * 60
 MAX_LLM_HISTORY = 10
+schema_lock = Lock()
+schema_ready = False
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 REFERENCE_RE = re.compile(r"^FP-\d{8}-\d{4}-[A-Z0-9]{4}$", re.IGNORECASE)
@@ -57,7 +69,12 @@ NUMBER_WORDS = {
 
 @app.before_request
 def limit_agent_requests():
-    limits = {"/api/chat": 5, "/api/payment-status": 10}
+    limits = {
+        "/api/auth/register": 5,
+        "/api/auth/login": 10,
+        "/api/chat": 5,
+        "/api/payment-status": 10,
+    }
     limit = limits.get(request.path)
     if limit is None or request.method != "POST":
         return None
@@ -73,6 +90,156 @@ def limit_agent_requests():
             return jsonify({"error": "Please wait a minute before trying again."}), 429
         requests_in_window.append(now)
         rate_windows[key] = requests_in_window
+    return None
+
+
+class AgentDatabaseUnavailable(Exception):
+    pass
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS booking_agent_users (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    full_name VARCHAR(100) NOT NULL,
+    email VARCHAR(254) NOT NULL UNIQUE,
+    phone VARCHAR(11) NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS booking_agent_sessions (
+    token_hash CHAR(64) PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES booking_agent_users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS booking_agent_sessions_user_id_idx
+    ON booking_agent_sessions(user_id);
+CREATE TABLE IF NOT EXISTS booking_agent_bookings (
+    reference TEXT PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES booking_agent_users(id) ON DELETE CASCADE,
+    summary TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS booking_agent_bookings_user_id_idx
+    ON booking_agent_bookings(user_id);
+ALTER TABLE booking_agent_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE booking_agent_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE booking_agent_bookings ENABLE ROW LEVEL SECURITY;
+"""
+
+
+def ensure_database_schema():
+    global schema_ready
+    if schema_ready:
+        return
+    if not SUPABASE_DATABASE_URL:
+        raise AgentDatabaseUnavailable(
+            "Account storage is not configured. Set SUPABASE_DATABASE_URL on the agent service."
+        )
+
+    with schema_lock:
+        if schema_ready:
+            return
+        try:
+            with psycopg.connect(
+                SUPABASE_DATABASE_URL,
+                connect_timeout=8,
+                sslmode="require",
+            ) as connection:
+                with connection.cursor() as cursor:
+                    for statement in SCHEMA_SQL.split(";"):
+                        if statement.strip():
+                            cursor.execute(statement)
+            schema_ready = True
+        except psycopg.Error as exc:
+            raise AgentDatabaseUnavailable(
+                "The account database is unavailable. Check SUPABASE_DATABASE_URL and the Supabase database connection."
+            ) from exc
+
+
+@contextmanager
+def database_connection():
+    ensure_database_schema()
+    try:
+        connection = psycopg.connect(
+            SUPABASE_DATABASE_URL,
+            connect_timeout=8,
+            sslmode="require",
+            row_factory=dict_row,
+        )
+    except psycopg.Error as exc:
+        raise AgentDatabaseUnavailable(
+            "The account database is unavailable. Check the Supabase database connection."
+        ) from exc
+
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def database_error_response(exc):
+    return jsonify({"error": str(exc)}), 503
+
+
+def safe_user(user):
+    return {
+        "id": user["id"],
+        "name": user["full_name"],
+        "email": user["email"],
+        "phone": user["phone"],
+    }
+
+
+def bearer_token():
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+@app.before_request
+def authenticate_private_routes():
+    private_routes = {
+        ("POST", "/api/chat"),
+        ("POST", "/api/payment-status"),
+        ("GET", "/api/auth/me"),
+        ("POST", "/api/auth/logout"),
+    }
+    if (request.method, request.path) not in private_routes:
+        return None
+
+    token = bearer_token()
+    if not token:
+        return jsonify({"error": "Please log in to continue."}), 401
+    token_hash = sha256(token.encode("utf-8")).hexdigest()
+    try:
+        with database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT u.id, u.full_name, u.email, u.phone
+                    FROM booking_agent_sessions AS s
+                    JOIN booking_agent_users AS u ON u.id = s.user_id
+                    WHERE s.token_hash = %s AND s.expires_at > now()
+                    """,
+                    (token_hash,),
+                )
+                user = cursor.fetchone()
+    except AgentDatabaseUnavailable as exc:
+        return database_error_response(exc)
+    except psycopg.Error:
+        return jsonify({"error": "The account database is unavailable. Please try again shortly."}), 503
+
+    if not user:
+        return jsonify({"error": "Your login has expired. Please log in again."}), 401
+    g.agent_user = safe_user(user)
+    g.agent_token_hash = token_hash
     return None
 
 
@@ -111,7 +278,7 @@ def backend_request(method, path, **kwargs):
     return payload
 
 
-def get_session(session_id):
+def get_session(session_id, user_id):
     now = time()
     with sessions_lock:
         expired = [
@@ -124,8 +291,9 @@ def get_session(session_id):
 
         if not session_id or len(session_id) > 80:
             session_id = str(uuid.uuid4())
+        key = (user_id, session_id)
         state = sessions.setdefault(
-            session_id,
+            key,
             {
                 "draft": None,
                 "stage": None,
@@ -334,16 +502,6 @@ def booking_summary(draft):
     )
 
 
-def configured_booker():
-    if not (BOOKER_NAME and BOOKER_EMAIL and BOOKER_PHONE):
-        return None
-    if not 2 <= len(BOOKER_NAME) <= 100:
-        return None
-    if not EMAIL_RE.fullmatch(BOOKER_EMAIL) or len(BOOKER_PHONE) != 11:
-        return None
-    return {"name": BOOKER_NAME, "email": BOOKER_EMAIL, "phone": BOOKER_PHONE}
-
-
 def response(session_id, reply, **extra):
     return jsonify({"session_id": session_id, "reply": reply, **extra})
 
@@ -372,7 +530,7 @@ def ask_for_next_booking_field(session_id, state):
     return None
 
 
-def begin_or_continue_booking(session_id, state, text):
+def begin_or_continue_booking(session_id, state, text, booker):
     if state["draft"] is None:
         state["draft"] = {"pitch_name": "Elite Football Pitch"}
     draft = state["draft"]
@@ -395,16 +553,6 @@ def begin_or_continue_booking(session_id, state, text):
     if prompt_response:
         return prompt_response
 
-    booker = configured_booker()
-    if not booker:
-        state["draft"] = None
-        state["stage"] = None
-        return response(
-            session_id,
-            "Your saved booking profile is not set up yet. Add BOOKER_NAME, BOOKER_EMAIL, and BOOKER_PHONE to the agent folder’s private .env file, then restart the agent. After that, a complete booking request will go straight to checkout without asking for those details each time.",
-            profile_required=True,
-        )
-
     try:
         quote = backend_chat(availability_prompt(draft))
     except BackendError as exc:
@@ -422,7 +570,13 @@ def begin_or_continue_booking(session_id, state, text):
         )
 
     draft["availability_reply"] = quote
-    draft.update(booker)
+    draft.update(
+        {
+            "name": booker["name"],
+            "email": booker["email"],
+            "phone": booker["phone"],
+        }
+    )
     return start_checkout(session_id, state, draft, quote)
 
 
@@ -479,6 +633,23 @@ def start_checkout(session_id, state, draft, quote):
         ), 502
 
     summary = booking_summary(draft)
+    try:
+        with database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO booking_agent_bookings (reference, user_id, summary)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (reference, g.agent_user["id"], summary),
+                )
+    except (AgentDatabaseUnavailable, psycopg.Error) as exc:
+        return response(
+            session_id,
+            "The booking service initialized checkout, but I could not securely link its reference to your account. Please contact the booking service before making another booking.",
+            error=True,
+        ), 503
+
     state["last_booking"] = {"reference": reference, "summary": summary}
     state["draft"] = None
     state["stage"] = None
@@ -491,7 +662,7 @@ def start_checkout(session_id, state, draft, quote):
     )
 
 
-def handle_booking_stage(session_id, state, text):
+def handle_booking_stage(session_id, state, text, booker):
     lowered = text.strip().lower()
     if lowered in {"cancel", "cancel booking", "start over"}:
         state["draft"] = None
@@ -499,22 +670,47 @@ def handle_booking_stage(session_id, state, text):
         return response(session_id, "I cancelled that booking draft. What would you like to check?")
 
     if state["stage"] == "slot":
-        return begin_or_continue_booking(session_id, state, text)
+        return begin_or_continue_booking(session_id, state, text, booker)
 
     state["draft"] = None
     state["stage"] = None
     return response(session_id, "That booking draft expired. Tell me the pitch, date, time, and duration to start again.")
 
 
-def get_session_id_and_state(session_id):
+def get_session_id_and_state(session_id, user_id):
     if not isinstance(session_id, str):
         session_id = None
-    return get_session(session_id)
+    return get_session(session_id, user_id)
 
 
-def payment_status_for_session(session_id, state, reference):
+def payment_status_for_session(session_id, state, reference, user_id):
     if not REFERENCE_RE.fullmatch(reference):
         return response(session_id, "That booking reference does not look valid.", error=True), 400
+
+    try:
+        with database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT summary
+                    FROM booking_agent_bookings
+                    WHERE reference = %s AND user_id = %s
+                    """,
+                    (reference, user_id),
+                )
+                booking = cursor.fetchone()
+    except AgentDatabaseUnavailable as exc:
+        return database_error_response(exc)
+    except psycopg.Error:
+        return jsonify({"error": "The account database is unavailable. Please try again shortly."}), 503
+
+    if not booking:
+        return response(
+            session_id,
+            "That booking reference was not found for this account.",
+            error=True,
+        ), 404
+
     try:
         result = backend_request("GET", f"/api/payment/verify/{reference}")
     except BackendError as exc:
@@ -526,9 +722,7 @@ def payment_status_for_session(session_id, state, reference):
 
     status = result.get("status", "Unknown")
     if status == "Confirmed":
-        last_booking = state.get("last_booking")
-        details = f" {last_booking['summary']}" if last_booking else ""
-        reply = f"Payment successful. Your booking is confirmed.{details} Reference: {reference}."
+        reply = f"Payment successful. Your booking is confirmed. {booking['summary']} Reference: {reference}."
     elif status == "Failed":
         reply = (
             f"The backend reports a failed or incomplete payment for reference {reference}. "
@@ -537,6 +731,122 @@ def payment_status_for_session(session_id, state, reference):
     else:
         reply = f"The current booking status is {status} for reference {reference}."
     return response(session_id, reply, booking_reference=reference, payment_status=status)
+
+
+@app.post("/api/auth/register")
+def register():
+    data = request.get_json(silent=True) or {}
+    name = data.get("name")
+    email = data.get("email")
+    phone = data.get("phone")
+    password = data.get("password")
+
+    if not all(isinstance(value, str) for value in (name, email, phone, password)):
+        return jsonify({"error": "Please complete all fields."}), 400
+    name = name.strip()
+    email = email.strip().lower()
+    phone = re.sub(r"\D", "", phone)
+    if not 2 <= len(name) <= 100:
+        return jsonify({"error": "Enter a name between 2 and 100 characters."}), 400
+    if len(email) > 254 or not EMAIL_RE.fullmatch(email):
+        return jsonify({"error": "Enter a valid email address."}), 400
+    if len(phone) != 11:
+        return jsonify({"error": "Enter your phone number as 11 digits."}), 400
+    if not 8 <= len(password) <= 128:
+        return jsonify({"error": "Password must be between 8 and 128 characters."}), 400
+
+    password_hash = generate_password_hash(password)
+    try:
+        with database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO booking_agent_users (full_name, email, phone, password_hash)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (name, email, phone, password_hash),
+                )
+    except psycopg_errors.UniqueViolation:
+        return jsonify({"error": "An account with this email already exists."}), 409
+    except AgentDatabaseUnavailable as exc:
+        return database_error_response(exc)
+    except psycopg.Error:
+        return jsonify({"error": "Could not create your account. Please try again."}), 503
+
+    return jsonify({"message": "Account created. Please log in."}), 201
+
+
+@app.post("/api/auth/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email")
+    password = data.get("password")
+    if not isinstance(email, str) or not isinstance(password, str) or len(password) > 128:
+        return jsonify({"error": "Incorrect email or password"}), 401
+    email = email.strip().lower()
+
+    try:
+        with database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, full_name, email, phone, password_hash
+                    FROM booking_agent_users
+                    WHERE email = %s
+                    """,
+                    (email,),
+                )
+                user = cursor.fetchone()
+                if not user or not check_password_hash(user["password_hash"], password):
+                    return jsonify({"error": "Incorrect email or password"}), 401
+
+                access_token = token_urlsafe(32)
+                token_hash = sha256(access_token.encode("utf-8")).hexdigest()
+                expires_at = datetime.now(timezone.utc) + timedelta(days=AUTH_SESSION_DAYS)
+                cursor.execute(
+                    "DELETE FROM booking_agent_sessions WHERE expires_at <= now()"
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO booking_agent_sessions (token_hash, user_id, expires_at)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (token_hash, user["id"], expires_at),
+                )
+    except AgentDatabaseUnavailable as exc:
+        return database_error_response(exc)
+    except psycopg.Error:
+        return jsonify({"error": "Could not log in right now. Please try again."}), 503
+
+    return jsonify(
+        {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": AUTH_SESSION_DAYS * 24 * 60 * 60,
+            "user": safe_user(user),
+        }
+    )
+
+
+@app.get("/api/auth/me")
+def current_user():
+    return jsonify({"user": g.agent_user})
+
+
+@app.post("/api/auth/logout")
+def logout():
+    try:
+        with database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM booking_agent_sessions WHERE token_hash = %s",
+                    (g.agent_token_hash,),
+                )
+    except (AgentDatabaseUnavailable, psycopg.Error) as exc:
+        if isinstance(exc, AgentDatabaseUnavailable):
+            return database_error_response(exc)
+        return jsonify({"error": "Could not sign out right now."}), 503
+    return jsonify({"message": "Signed out."})
 
 
 @app.get("/api/health")
@@ -558,17 +868,20 @@ def chat():
     if len(text) > 500:
         return jsonify({"error": "Please keep messages under 500 characters."}), 400
 
-    session_id, state = get_session_id_and_state(data.get("session_id"))
+    user = g.agent_user
+    session_id, state = get_session_id_and_state(data.get("session_id"), user["id"])
     reference_match = REFERENCE_RE.search(text)
     if reference_match and re.search(r"\b(payment|status|paid|booking)\b", text, re.I):
-        return payment_status_for_session(session_id, state, reference_match.group(0))
+        return payment_status_for_session(
+            session_id, state, reference_match.group(0), user["id"]
+        )
 
     if state["stage"]:
-        return handle_booking_stage(session_id, state, text)
+        return handle_booking_stage(session_id, state, text, user)
 
     booking_intent = bool(re.search(r"\b(book|reserve)\b", text, re.I))
     if booking_intent:
-        return begin_or_continue_booking(session_id, state, text)
+        return begin_or_continue_booking(session_id, state, text, user)
 
     try:
         history = state["llm_history"][-MAX_LLM_HISTORY:]
@@ -586,8 +899,12 @@ def payment_status():
     reference = data.get("reference")
     if not isinstance(reference, str) or not REFERENCE_RE.fullmatch(reference):
         return jsonify({"error": "Please provide a valid booking reference."}), 400
-    session_id, state = get_session_id_and_state(data.get("session_id"))
-    result = payment_status_for_session(session_id, state, reference)
+    session_id, state = get_session_id_and_state(
+        data.get("session_id"), g.agent_user["id"]
+    )
+    result = payment_status_for_session(
+        session_id, state, reference, g.agent_user["id"]
+    )
     if isinstance(result, tuple):
         return result
     return result
